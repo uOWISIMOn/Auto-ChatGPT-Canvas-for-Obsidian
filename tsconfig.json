@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES6",
+    "module": "ESNext",
+    "lib": ["DOM", "ES2020"],
+    "moduleResolution": "node",
+    "strict": false,
+    "noEmitOnError": true,
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "rootDir": "./",
+    "outDir": "./",
+    "types": ["obsidian"]
+  },
+  "include": ["main.ts", "globals.d.ts"],
+  "exclude": ["node_modules"]
+}

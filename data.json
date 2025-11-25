@@ -1,0 +1,32 @@
+{
+  "chatgptUrl": "https://chatgpt.com",
+  "autoCreateCanvas": true,
+  "enableDevtools": false,
+  "layout": {
+    "nodeWidth": 420,
+    "minNodeHeight": 96,
+    "maxNodeHeight": 520,
+    "baseLineHeight": 18,
+    "charsPerLine": 36,
+    "verticalGap": 88,
+    "horizontalGap": 48,
+    "startX": 160,
+    "startY": 120,
+    "refWidth": 340,
+    "refHeight": 140,
+    "refGap": 16,
+    "refColumnGap": 32
+  },
+  "sessionFolders": {
+    "default": "[25-11-25][09-22-06]",
+    "6924f6d8-3b90-8320-9f71-136aaf61bfd8": "[25-11-25][09-22-49]",
+    "6924fb11-3f74-8321-b7f0-207a54653965": "[25-11-25][09-40-52]",
+    "6924fd4c-0c30-8322-be85-d8cb8f504519": "[25-11-25][09-50-22]",
+    "6924ff00-587c-8320-a865-368410be3f56": "[25-11-25][09-57-39]",
+    "69250046-e26c-8322-a5b9-62f5955069ca": "[25-11-25][10-03-06]",
+    "692502d7-0448-8323-98c0-9a38ef51ff93": "[25-11-25][10-14-01]",
+    "692503cb-f860-8322-8597-4a2a180eea67": "[25-11-25][10-18-07]",
+    "6925049c-d62c-8329-99f0-1b9c6d389bf4": "[25-11-25][10-21-36]"
+  },
+  "autoCreateMd": true
+}
