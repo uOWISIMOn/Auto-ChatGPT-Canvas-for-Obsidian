@@ -1,8 +1,7 @@
 Auto ChatGPT Canvas for Obsidian
 -
-A lightweight Obsidian plugin that embeds ChatGPT inside Obsidian, tracks Ask ChatGPT interactions, and automatically generates a Canvas mind-map representing parent–child relationships across your ChatGPT conversation.
-
 本插件通过监听你在 ChatGPT 网页中使用“询问 ChatGPT”（Ask ChatGPT）按钮的行为，自动记录引用链并构建可视化的思维脑图。  
+A lightweight Obsidian plugin that embeds ChatGPT inside Obsidian, tracks Ask ChatGPT interactions, and automatically generates a Canvas mind-map representing parent–child relationships across your ChatGPT conversation.
 
 <br>
   
