@@ -15,6 +15,9 @@ A lightweight Obsidian plugin that embeds ChatGPT inside Obsidian, tracks Ask Ch
 
 -🗂️ Automatically creates a ChatGPT Logs folder for session data
 
+New Feature:
+Support for Alt-clicking Canvas nodes to jump directly to the corresponding message position in the ChatGPT webpage conversation.
+
 <br>
 
 📘 How to Use / 使用方法
