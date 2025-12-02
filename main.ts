@@ -8,13 +8,28 @@ import {
   ItemView,
   WorkspaceLeaf,
   normalizePath,
-} from "obsidian";
+  TFile,
+  setIcon,
+} from 'obsidian';
 
-const VIEW_TYPE_CHATGPT = "gptcanvas-chatgpt-view";
-const LOG_ROOT = "ChatGPT Logs";
+const VIEW_TYPE_CHATGPT = 'gptcanvas-chatgpt-view';
+const LOG_ROOT = 'ChatGPT Logs';
+
+type ChatWebViewElement = HTMLElement & {
+  getURL?: () => string;
+  loadURL?: (url: string) => void;
+  executeJavaScript<T = unknown>(code: string): Promise<T>;
+  addEventListener: (type: string, listener: (...args: any[]) => void, options?: any) => void;
+};
 
 /** ========= 数据结构 ========= */
-type Role = "user" | "assistant";
+type Role = 'user' | 'assistant';
+
+export interface GptNodeMeta {
+  sessionId: string;
+  sessionUrl: string;
+  messageTestId: string;
+}
 
 interface MessageItem {
   id: string;          // == domId（跨会话唯一），作为主键
@@ -83,13 +98,14 @@ interface LayoutSettings {
 
 interface CanvasNode {
   id: string;
-  type: "text";
+  type: 'text';
   x: number;
   y: number;
   width: number;
   height: number;
   text: string;
   color?: string;      // Obsidian Canvas 颜色：user=4, assistant=3, ref=2
+  object?: GptNodeMeta;
 }
 
 interface CanvasEdge {
@@ -134,7 +150,7 @@ const DEFAULT_LAYOUT: LayoutSettings = {
 };
 
 const DEFAULT_SETTINGS: GptCanvasSettings = {
-  chatgptUrl: "https://chatgpt.com",
+  chatgptUrl: 'https://chatgpt.com',
   autoCreateCanvas: true,
   enableDevtools: false,
   layout: DEFAULT_LAYOUT,
@@ -144,7 +160,7 @@ const DEFAULT_SETTINGS: GptCanvasSettings = {
 /** ========= 插件 ========= */
 export default class GptCanvasPlugin extends Plugin {
   settings: GptCanvasSettings;
-  currentSessionId = "default";
+  currentSessionId = 'default';
   private activeRoundId = 0;
   private nextRoundId = 0;
 
@@ -153,6 +169,7 @@ export default class GptCanvasPlugin extends Plugin {
     await this.ensureFolder(LOG_ROOT);
 
     this.registerView(VIEW_TYPE_CHATGPT, (leaf) => new ChatGPTView(leaf, this));
+    this.registerCanvasClickHandler();
 
     this.addCommand({
       id: "open-chatgpt-sidebar",
@@ -258,7 +275,7 @@ export default class GptCanvasPlugin extends Plugin {
   }
 
   async writeSession(data: SessionData) {
-    const firstUser = data.messages.find((m) => m.role === "user");
+    const firstUser = data.messages.find((m) => m.role === 'user');
     const firstAny = data.messages[0];
     const ts = (firstUser?.ts ?? firstAny?.ts) ?? Date.now();
     const base = this.ensureSessionFolderForTimestamp(this.currentSessionId, ts);
@@ -285,6 +302,22 @@ export default class GptCanvasPlugin extends Plugin {
     const s = (md || "").replace(/\n{3,}/g, "\n\n").trim();
     if (s.length <= maxChars) return s;
     return s.slice(0, maxChars) + " …";
+  }
+
+   /**
+    * Build per-node metadata used to navigate back into ChatGPT.
+    * sessionUrl is taken directly from session.json without reconstruction.
+    */
+  private buildNodeMetaForMessage(message: MessageItem, sessionUrl?: string | null): GptNodeMeta | null {
+    if (!sessionUrl) return null;
+    const sessionId = this.getSessionIdFromUrl(sessionUrl);
+    const messageTestId = message.domId || message.id;
+    if (!messageTestId) return null;
+    return {
+      sessionId,
+      sessionUrl,
+      messageTestId,
+    };
   }
 
   private pad2(num: number) { return num.toString().padStart(2, "0"); }
@@ -469,6 +502,7 @@ export default class GptCanvasPlugin extends Plugin {
     await this.ensureFolder(folder);
     const adapter = this.app.vault.adapter;
     const L = this.settings.layout;
+    const sessionUrl = data.sessionUrl ?? null;
 
     const nodes: CanvasNode[] = [];
     const edges: CanvasEdge[] = [];
@@ -515,31 +549,37 @@ export default class GptCanvasPlugin extends Plugin {
       const aX = baseX + qWidth + L.horizontalGap;
       let rowHeight = qSize.height;
 
-      nodes.push({
+      const qMeta = this.buildNodeMetaForMessage(turn.q, sessionUrl);
+      const qNode: CanvasNode = {
         id: turn.q.id,
-        type: "text",
+        type: 'text',
         x: baseX,
         y: baseY,
         width: qWidth,
         height: qSize.height,
         text: qFull,
-        color: "4",
-      });
+        color: '4',
+      };
+      if (qMeta) qNode.object = qMeta;
+      nodes.push(qNode);
 
       if (turn.a) {
         const aHeader = `A #${label}`;
         const aFull = `${aHeader}\n${turn.a.text}`;
         const aSize = this.computeNodeSize(aFull, aWidth);
-        nodes.push({
+        const aMeta = this.buildNodeMetaForMessage(turn.a, sessionUrl);
+        const aNode: CanvasNode = {
           id: turn.a.id,
-          type: "text",
+          type: 'text',
           x: aX,
           y: baseY,
           width: aWidth,
           height: aSize.height,
           text: aFull,
-          color: "3",
-        });
+          color: '3',
+        };
+        if (aMeta) aNode.object = aMeta;
+        nodes.push(aNode);
         rowHeight = Math.max(rowHeight, aSize.height);
       }
 
@@ -587,13 +627,13 @@ export default class GptCanvasPlugin extends Plugin {
       const infoX = L.startX - infoWidth - L.horizontalGap;
       nodes.push({
         id: `info_${this.currentSessionId}`,
-        type: "text",
+        type: 'text',
         x: infoX,
         y: L.startY,
         width: infoWidth,
         height: infoSize.height,
         text: infoText,
-        color: "2",
+        color: '2',
       });
     }
 
@@ -636,47 +676,500 @@ export default class GptCanvasPlugin extends Plugin {
     if (!view) return;
     await view.scrollToMessage(messageId); // 直接用 domId
   }
+
+  /** ========= ChatGPT WebView 导航 ========= */
+  private findChatWebViewLeaf(): WorkspaceLeaf | null {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHATGPT);
+    for (const leaf of leaves) {
+      const view = leaf.view as ChatGPTView;
+      if (!view || !view.webviewEl) continue;
+      const url = view.getCurrentUrl();
+      if (url && url.startsWith('https://chatgpt.com')) {
+        return leaf;
+      }
+    }
+    return null;
+  }
+
+  private async openChatViewInLeaf(leaf: WorkspaceLeaf, url: string): Promise<void> {
+    await leaf.setViewState({ type: VIEW_TYPE_CHATGPT, active: true });
+    const view = leaf.view as ChatGPTView;
+    if (view) {
+      view.setInitialUrl(url);
+    }
+  }
+
+  private async ensureChatSession(leaf: WorkspaceLeaf, meta: GptNodeMeta): Promise<ChatWebViewElement> {
+    const view = leaf.view as ChatGPTView;
+    if (!view) throw new Error('[gptCanvas] Leaf does not host ChatGPTView');
+    const webview = await view.ensureSession(meta.sessionUrl);
+    return webview;
+  }
+
+  private async scrollToChatMessageInWebview(webview: ChatWebViewElement, meta: GptNodeMeta): Promise<void> {
+    const targetId = meta.messageTestId;
+    console.log(`[gptCanvas][DEBUG] Injecting JS to scroll to ID: ${targetId}`);
+
+    // 使用更健壮的查找逻辑：同时尝试 data-testid (官方常见) 和 data-message-id (插件抓取时常用)
+    // 并且添加了 detailed logging 到 Webview 内部的控制台
+    const js = `
+      (function() {
+        console.log("[gptCanvas][Webview] Trying to scroll to:", "${targetId}");
+        
+        const selectors = [
+          '[data-testid="${targetId}"]',
+          '[data-message-id="${targetId}"]',
+          '#${targetId}' // 兜底尝试 ID
+        ];
+
+        let el = null;
+        for (let sel of selectors) {
+          el = document.querySelector(sel);
+          if (el) {
+            console.log("[gptCanvas][Webview] Found element via selector:", sel);
+            break;
+          }
+        }
+
+        if (!el) {
+          console.error("[gptCanvas][Webview] Element NOT found for id:", "${targetId}");
+          return false;
+        }
+
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        
+        // 高亮一下，方便肉眼确认
+        const originalBg = el.style.backgroundColor;
+        el.style.backgroundColor = "rgba(255, 255, 0, 0.3)";
+        el.style.transition = "background-color 0.5s";
+        setTimeout(() => {
+           el.style.backgroundColor = originalBg;
+        }, 2000);
+
+        return true;
+      })();
+    `;
+    
+    try {
+      await webview.executeJavaScript(js);
+      console.log('[gptCanvas][DEBUG] JS Injection sent successfully.');
+    } catch (e) {
+      console.error('[gptCanvas][ERROR] scrollToChatMessageInWebview execution failed:', e);
+    }
+  }
+
+  async navigateToChatMessage(meta: GptNodeMeta): Promise<void> {
+    console.log('[gptCanvas][DEBUG] Starting Navigation. Target:', meta);
+
+    let leaf = this.findChatWebViewLeaf();
+    if (!leaf) {
+      console.log('[gptCanvas][DEBUG] No existing Chat Leaf found. Opening new one.');
+      leaf = this.app.workspace.getRightLeaf(false) || this.app.workspace.getRightLeaf(true);
+      if (!leaf) {
+        new Notice('Cannot get right sidebar leaf for ChatGPT view');
+        return;
+      }
+      await this.openChatViewInLeaf(leaf, meta.sessionUrl);
+    } else {
+       console.log('[gptCanvas][DEBUG] Found existing Chat Leaf.');
+    }
+
+    // 确保 URL 加载
+    console.log('[gptCanvas][DEBUG] Ensuring session URL:', meta.sessionUrl);
+    const webview = await this.ensureChatSession(leaf, meta);
+    
+    // 触发滚动
+    console.log('[gptCanvas][DEBUG] Executing Scroll Command...');
+    await this.scrollToChatMessageInWebview(webview, meta);
+    
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
+  }
+
+  /** ========= Canvas 集成：节点点击 ========= */
+  /** ========= Canvas 集成：节点点击 & 按钮注入 ========= */
+  private registerCanvasClickHandler(): void {
+    this.registerDomEvent(document, 'click', async (evt: MouseEvent) => {
+      // 允许按 Alt(Windows/Mac Option) 或者 Meta(Mac Command) 键触发
+      if (!evt.altKey && !evt.metaKey) return;
+
+      const target = evt.target as HTMLElement | null;
+      if (!target) return;
+
+      const activeLeaf = this.app.workspace.activeLeaf;
+      const view = activeLeaf?.view as any;
+      if (view?.getViewType() !== 'canvas') return;
+
+      // 1. 尝试找到最近的 Canvas 节点容器
+      const nodeEl = target.closest('.canvas-node') as HTMLElement | null;
+      if (!nodeEl) return;
+
+      console.log('[gptCanvas][DEBUG] Alt+Click detected on a canvas node.');
+
+      // 2. [核心修复] 通过遍历 Canvas 内部数据结构来查找 ID
+      // 这种方式不依赖 DOM 属性 (data-id)，是最稳健的
+      let foundId: string | null = null;
+      
+      try {
+        if (view.canvas && view.canvas.nodes) {
+            // view.canvas.nodes 是一个 Map<string, CanvasNode>
+            // 每一个 node 对象都有一个 .nodeEl 属性指向它的 DOM
+            for (const [id, node] of view.canvas.nodes) {
+                if (node.nodeEl === nodeEl) {
+                    foundId = id;
+                    break;
+                }
+            }
+        }
+      } catch (e) {
+        console.error('[gptCanvas] Error accessing canvas internals:', e);
+      }
+
+      // 兜底：如果 API 查找失败，还是试一下 DOM（万一以后版本加回来了）
+      if (!foundId) {
+        foundId = nodeEl.getAttribute('data-id') || 
+                  nodeEl.getAttribute('data-node-id') || 
+                  nodeEl.id;
+      }
+
+      console.log(`[gptCanvas][DEBUG] Resolved Node ID: "${foundId}"`);
+
+      if (!foundId) {
+        console.error('[gptCanvas][ERROR] Could not associate DOM element with a Canvas Node ID.');
+        new Notice('GptCanvas: 无法识别该节点的 ID');
+        return;
+      }
+
+      evt.preventDefault();
+      evt.stopPropagation();
+
+      await this.handleCanvasNodeClickById(foundId).catch((err) => {
+        console.error('[gptCanvas][ERROR] handleCanvasNodeClickById failed:', err);
+      });
+    }, true);
+  }
+
+  /** * 更强壮的按钮注入逻辑 
+   * 现在的 Obsidian Canvas 工具栏通常名为 .canvas-node-menu 或位于 shadow DOM 附近
+   * 我们尝试查找节点内部或其关联的弹出菜单
+   */
+  private ensureCanvasToolbarButtonRobust(nodeEl: HTMLElement, nodeId: string): void {
+    // 策略 A: 查找节点内部的菜单 (旧版或特定主题)
+    let toolbar = nodeEl.querySelector('.canvas-node-menu, .canvas-node-toolbar') as HTMLElement;
+
+    // 策略 B: 查找紧邻的兄弟元素 (常见于当前版本)
+    // 当节点被选中时，Obsidian 经常在 canvas-node 旁边渲染一个 menu
+    if (!toolbar && nodeEl.parentElement) {
+       // 这是一个基于位置的猜测，寻找最近的菜单
+       const menus = nodeEl.parentElement.querySelectorAll('.canvas-node-menu');
+       // 简单的启发式：通常最后一个渲染的菜单属于当前选中的节点
+       if (menus.length > 0) {
+         toolbar = menus[menus.length - 1] as HTMLElement;
+       }
+    }
+
+    if (!toolbar) {
+      // 如果还没找到，可能是尚未渲染，不要强求，依赖 Alt+Click
+      return;
+    }
+
+    // 防止重复注入
+    if (toolbar.querySelector('[data-gptcanvas-action="jump-chat"]')) return;
+
+    const btn = document.createElement('div'); // 使用 div 模拟按钮，避免默认 button 样式冲突
+    btn.setAttribute('data-gptcanvas-action', 'jump-chat');
+    btn.setAttribute('data-node-id', nodeId);
+    btn.className = 'clickable-icon canvas-node-menu-item'; // 使用 Obsidian 标准类名
+    btn.setAttribute('aria-label', 'Jump to ChatGPT Log');
+    
+    // SVG 图标 (外链箭头)
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg>`;
+    
+    // 插入到工具栏最前面
+    toolbar.insertBefore(btn, toolbar.firstChild);
+  }
+
+  private async readNodeMetaFromActiveCanvas(nodeId: string): Promise<GptNodeMeta | null> {
+    console.log(`[gptCanvas][DEBUG] Reading meta for node: ${nodeId}`);
+    
+    const activeLeaf = this.app.workspace.activeLeaf;
+    const view = activeLeaf?.view as any;
+    const file: TFile | undefined = view?.file;
+
+    if (!file) {
+      console.error('[gptCanvas][ERROR] Current view has no backing file.');
+      return null;
+    }
+
+    try {
+      const raw = await this.app.vault.adapter.read(file.path);
+      // console.log('[gptCanvas][DEBUG] Canvas file raw content length:', raw.length);
+      
+      const data = JSON.parse(raw) as { nodes?: Array<{ id: string; object?: unknown }> };
+      const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+      const node = nodes.find((n) => n && n.id === nodeId);
+
+      if (!node) {
+        console.error(`[gptCanvas][ERROR] Node ID ${nodeId} not found in canvas JSON.`);
+        return null;
+      }
+
+      console.log('[gptCanvas][DEBUG] Found node data:', node);
+
+      if (node.object == null) {
+        console.error('[gptCanvas][ERROR] Node has no "object" field (Meta is missing).');
+        return null;
+      }
+
+      const rawMeta = node.object as any;
+      // 兼容有时候 object 被存为字符串的情况
+      let meta: GptNodeMeta;
+      try {
+        meta = typeof rawMeta === 'string' ? JSON.parse(rawMeta) : rawMeta;
+      } catch (e) {
+        console.error('[gptCanvas][ERROR] Failed to parse meta JSON:', rawMeta);
+        return null;
+      }
+
+      console.log('[gptCanvas][DEBUG] Parsed Meta:', meta);
+      
+      if (!meta.sessionUrl || !meta.messageTestId) {
+         console.error('[gptCanvas][ERROR] Meta is incomplete (missing url or id).');
+         return null;
+      }
+
+      return meta;
+    } catch (e) {
+      console.error('[gptCanvas][ERROR] readNodeMetaFromActiveCanvas exception:', e);
+      return null;
+    }
+  }
+
+  private async handleCanvasNodeClickById(nodeId: string): Promise<void> {
+    const meta = await this.readNodeMetaFromActiveCanvas(nodeId);
+    if (!meta) return;
+    await this.navigateToChatMessage(meta);
+  }
+
+
+  /** 从运行时 CanvasNode（而不是文件 JSON）上提取 GptNodeMeta */
+  private extractMetaFromCanvasNode(node: any): GptNodeMeta | null {
+    if (!node) return null;
+    let data: any = node;
+    try {
+      if (typeof node.getData === 'function') {
+        data = node.getData();
+      } else if (node.data) {
+        data = node.data;
+      }
+    } catch (e) {
+      console.error('[gptCanvas] extractMetaFromCanvasNode getData error', e);
+    }
+
+    if (!data) return null;
+    const rawMeta = (data as any).object ?? (data as any).gptMeta ?? null;
+    if (!rawMeta) return null;
+
+    let meta: GptNodeMeta;
+    try {
+      meta = typeof rawMeta === 'string' ? JSON.parse(rawMeta) : rawMeta;
+    } catch (e) {
+      console.error('[gptCanvas] extractMetaFromCanvasNode invalid meta', e, rawMeta);
+      return null;
+    }
+
+    if (!meta || !meta.sessionUrl || !meta.messageTestId) return null;
+    return meta;
+  }
+
+  /** 在 Canvas 节点上方的工具栏中插入一个按钮，用于跳转回 ChatGPT */
+  private ensureCanvasToolbarButton(nodeEl: HTMLElement, nodeId: string): void {
+    const nodeContainer = (nodeEl.closest('.canvas-node') as HTMLElement | null) ?? nodeEl;
+    if (!nodeContainer) return;
+
+    // Obsidian 当前版本中，节点上方工具栏容器的类名在不同版本中可能略有差异
+    // 这里尽量兼容几种常见命名：.canvas-node-toolbar / .canvas-node-menu / .canvas-node-controls
+    const toolbar =
+      (nodeContainer.querySelector('.canvas-node-toolbar, .canvas-node-menu, .canvas-node-controls') as HTMLElement | null) ||
+      (nodeContainer.parentElement?.querySelector('.canvas-node-toolbar, .canvas-node-menu, .canvas-node-controls') as HTMLElement | null);
+    if (!toolbar) {
+      console.log('[gptCanvas] No canvas node toolbar found near node; skip button injection');
+      return;
+    }
+
+    // 已经插过就不重复插入
+    if (toolbar.querySelector('[data-gptcanvas-action="jump-chat"]')) return;
+
+    const btn = document.createElement('button');
+    btn.setAttribute('type', 'button');
+    btn.setAttribute('data-gptcanvas-action', 'jump-chat');
+    btn.setAttribute('data-node-id', nodeId);
+    btn.setAttribute('aria-label', '跳转到对应的 ChatGPT 消息');
+    btn.classList.add('clickable-icon');
+    // 如果 Obsidian Canvas 使用了类似的按钮类，可以一起复用以保持风格
+    btn.classList.add('canvas-node-control');
+
+    // 使用 Obsidian 内置图标（例如箭头向外）
+    try {
+      setIcon(btn, 'arrow-up-right');
+    } catch {
+      btn.textContent = 'GPT';
+    }
+
+    toolbar.appendChild(btn);
+  }
 }
 
 /** ========= ChatGPT 视图 ========= */
 class ChatGPTView extends ItemView {
   plugin: GptCanvasPlugin;
-  webviewEl: any;
+  webviewEl: ChatWebViewElement | null;
+  private initialUrl: string | null = null;
+  private currentUrl: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: GptCanvasPlugin) {
     super(leaf);
     this.plugin = plugin;
+    this.webviewEl = null;
   }
 
   getViewType() { return VIEW_TYPE_CHATGPT; }
-  getDisplayText() { return "ChatGPT Workspace"; }
+  getDisplayText() { return 'ChatGPT Workspace'; }
+
+  setInitialUrl(url: string): void {
+    this.initialUrl = url;
+    if (this.webviewEl) {
+      this.loadUrl(url);
+    }
+  }
+
+  // ... 在 ChatGPTView 类内部 ...
+
+  // [新增] 等待 Webview 就绪的辅助函数
+  private async awaitReady(): Promise<void> {
+    if (!this.webviewEl) return;
+    // 简单的检查：如果 isLoading 没报错且为 false，或者已经能获取 URL，说明可能就绪了
+    // 但最稳妥的是监听 dom-ready。这里我们做一个轮询等待，防止死锁。
+    let attempts = 0;
+    while (attempts < 20) { // 最多等 2 秒
+      try {
+        // 尝试调用一个轻量方法测试是否就绪
+        if (this.webviewEl.getURL && typeof this.webviewEl.getURL === 'function') {
+           this.webviewEl.getURL(); // 如果没报错，说明 attach 好了
+           return;
+        }
+      } catch (e) {
+        // 还没准备好，继续等
+      }
+      await new Promise(r => setTimeout(r, 100));
+      attempts++;
+    }
+  }
+
+  getCurrentUrl(): string | null {
+    if (!this.webviewEl) return null;
+    try {
+      if (typeof this.webviewEl.getURL === 'function') {
+        return this.webviewEl.getURL() || null;
+      }
+      const anyWeb = this.webviewEl as any;
+      if (typeof anyWeb.src === 'string') return anyWeb.src;
+    } catch (e) {
+      // 忽略未就绪时的报错
+      console.warn('[gptCanvas] getCurrentUrl called before webview ready');
+      return this.currentUrl; // 返回最后一次设置的 JS 变量
+    }
+    return this.currentUrl;
+  }
+
+  private async loadUrl(url: string): Promise<void> {
+    if (!this.webviewEl) return;
+    this.currentUrl = url; // 先更新本地状态
+    
+    // 如果还没就绪，onOpen 里的 dom-ready 监听器会负责加载 initialUrl
+    // 这里尝试直接加载
+    try {
+        if (typeof this.webviewEl.loadURL === 'function') {
+            await this.awaitReady(); // [关键] 等待就绪
+            this.webviewEl.loadURL(url);
+        } else {
+            (this.webviewEl as any).src = url;
+        }
+    } catch (e) {
+      console.error('[gptCanvas] loadUrl error (ignored, will retry via src):', e);
+      // 兜底
+      (this.webviewEl as any).src = url;
+    }
+  }
+
+  // [修改] 变得更健壮的 ensureSession
+  async ensureSession(sessionUrl: string): Promise<ChatWebViewElement> {
+    if (!this.webviewEl) {
+      await this.onOpen();
+    }
+    if (!this.webviewEl) {
+      throw new Error('[gptCanvas] Webview not available');
+    }
+
+    const webview = this.webviewEl;
+    
+    // [关键] 必须等待 Webview 挂载到 DOM
+    await this.awaitReady();
+
+    const current = this.getCurrentUrl();
+    // 忽略末尾斜杠差异
+    const normalize = (u: string) => (u || "").replace(/\/+$/, "");
+    
+    if (!current || normalize(current) !== normalize(sessionUrl)) {
+      console.log(`[gptCanvas] Navigating from [${current}] to [${sessionUrl}]`);
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        // 设定超时，防止网页加载卡死导致插件无响应
+        const timer = setTimeout(() => {
+            console.log('[gptCanvas] Navigation timeout, proceeding anyway.');
+            resolve();
+        }, 5000); 
+
+        webview.addEventListener('dom-ready', () => {
+            clearTimeout(timer);
+            resolve();
+        }, { once: true });
+        
+        this.loadUrl(sessionUrl);
+      });
+    }
+
+    return webview;
+  }
 
   async onOpen() {
     const container = this.containerEl;
     container.empty();
 
-    const web = document.createElement("webview") as any;
-    web.setAttribute("partition", "persist:gptcanvas");
-    web.setAttribute("allowpopups", "true");
-    web.style.width = "100%";
-    web.style.height = "100%";
-    web.style.border = "none";
-    web.src = this.plugin.settings.chatgptUrl || "https://chatgpt.com";
+    const web = document.createElement('webview') as ChatWebViewElement;
+    web.setAttribute('partition', 'persist:gptcanvas');
+    web.setAttribute('allowpopups', 'true');
+    web.style.width = '100%';
+    web.style.height = '100%';
+    web.style.border = 'none';
 
     this.webviewEl = web;
+    const initial = this.initialUrl || this.plugin.settings.chatgptUrl || 'https://chatgpt.com';
+    // IMPORTANT: when the webview is not yet attached to the DOM, use src instead of loadURL
+    (web as any).src = initial;
+    this.currentUrl = initial;
+
     container.appendChild(web);
 
-    web.addEventListener("did-navigate", (e: any) => {
+    web.addEventListener('did-navigate', (e: any) => {
       this.plugin.setSessionFromUrl(e.url);
     });
-    web.addEventListener("did-navigate-in-page", (e: any) => {
+    web.addEventListener('did-navigate-in-page', (e: any) => {
       this.plugin.setSessionFromUrl(e.url);
     });
 
-    web.addEventListener("dom-ready", async () => {
+    web.addEventListener('dom-ready', async () => {
       try {
-        await web.executeJavaScript(this.buildInjectScript());
-        await this.setRound(this.activeRoundId);
+        await web.executeJavaScript(this.buildInjectScript()); 
         if (this.plugin.settings.enableDevtools) {
           try { (web as any).openDevTools(); } catch {}
         }
@@ -685,7 +1178,7 @@ class ChatGPTView extends ItemView {
       }
     });
 
-    web.addEventListener("console-message", async (e: any) => {
+    web.addEventListener('console-message', async (e: any) => {
       const raw: string = e.message || "";
       if (!raw.startsWith("[gptCanvas][")) return;
 
@@ -800,6 +1293,16 @@ class ChatGPTView extends ItemView {
         var level = parseInt(tag[1],10);
         return "\\n\\n"+("#".repeat(level))+" "+escTxt(getText(node))+"\\n\\n";
       }
+      if(node.classList && node.classList.contains("katex")){
+        var annotation = node.querySelector("annotation");
+        if(annotation){
+          var tex = annotation.textContent || "";
+          // 判断是否为块级公式 (display mode)
+          var isBlock = node.classList.contains("katex-display") || 
+                        (node.parentElement && node.parentElement.classList.contains("katex-display"));
+          return isBlock ? (" $$" + tex + "$$ ") : (" $" + tex + "$ ");
+        }
+      }
       if(tag==="strong"||tag==="b"){ return "**"+walkChildren(node)+"**"; }
       if(tag==="em"||tag==="i"){ return "*"+walkChildren(node)+"*"; }
       if(tag==="del"||tag==="s"){ return "~~"+walkChildren(node)+"~~"; }
@@ -813,12 +1316,13 @@ class ChatGPTView extends ItemView {
         var src=node.getAttribute("src")||"";
         return "!["+alt+"]("+src+")";
       }
-      if(tag==="ul"){
-        var out="\\n";
+    if(tag==="ul"){
+        var out="\\n";  // 注意这里是双斜杠
         var items=node.children;
         for(var i=0;i<items.length;i++){
           if(items[i].tagName && items[i].tagName.toLowerCase()==="li"){
-            out += "- "+walkChildren(items[i]).replace(/\\n/g," ")+"\\n";
+            // 修正点：replace(/\\n/g, " ") 和 末尾的 "\\n" 都要双斜杠
+            out += "- "+walkChildren(items[i]).trim().replace(/\\n/g," ")+"\\n";
           }
         }
         return out+"\\n";
@@ -829,7 +1333,8 @@ class ChatGPTView extends ItemView {
         var its=node.children;
         for(var j=0;j<its.length;j++){
           if(its[j].tagName && its[j].tagName.toLowerCase()==="li"){
-            outo += (n++)+". "+walkChildren(its[j]).replace(/\\n/g," ")+"\\n";
+            // 修正点：同样全是双斜杠
+            outo += (n++)+". "+walkChildren(its[j]).trim().replace(/\\n/g," ")+"\\n";
           }
         }
         return outo+"\\n";
