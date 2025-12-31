@@ -10,6 +10,7 @@ import {
   normalizePath,
   TFile,
   setIcon,
+  debounce,
 } from 'obsidian';
 
 const VIEW_TYPE_CHATGPT = 'gptcanvas-chatgpt-view';
@@ -29,6 +30,10 @@ export interface GptNodeMeta {
   sessionId: string;
   sessionUrl: string;
   messageTestId: string;
+  // 记录上一次插件自动分配的坐标
+  lastAutoPos?: { x: number; y: number };
+  // 如果用户挪动了位置，此处记录绝对坐标，插件将不再自动计算其位置
+  manualPos?: { x: number; y: number };
 }
 
 interface MessageItem {
@@ -79,6 +84,20 @@ interface SnapshotPayload {
   selection?: SnapshotSelection | null;
 }
 
+interface CardStyle {
+  width?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  headingLevel?: number;  // 0=text, 1-6=heading levels
+}
+
+interface CardStyles {
+  rootQuestion: CardStyle;
+  rootAnswer: CardStyle;
+  childQuestion: CardStyle;
+  childAnswer: CardStyle;
+}
+
 interface LayoutSettings {
   nodeWidth: number;         // 主轴卡片宽
   minNodeHeight: number;     // 主轴最小高
@@ -94,6 +113,7 @@ interface LayoutSettings {
   refHeight: number;         // 次轴小卡片固定高（A2B2C1：次轴固定高度）
   refGap: number;            // 次轴小卡片上下间距
   refColumnGap: number;      // A 到次轴列的水平间距（留点缓冲）
+  cardStyles: CardStyles;    // 各类 Q/A 卡片尺寸、字体等自定义
 }
 
 interface CanvasNode {
@@ -106,6 +126,18 @@ interface CanvasNode {
   text: string;
   color?: string;      // Obsidian Canvas 颜色：user=4, assistant=3, ref=2
   object?: GptNodeMeta;
+}
+
+interface NodePosition {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface BoundingBox {
+  right: number;
+  bottom: number;
 }
 
 interface CanvasEdge {
@@ -132,6 +164,13 @@ interface GptCanvasSettings {
   sessionFolders?: Record<string, string>;
 }
 
+const DEFAULT_CARD_STYLES: CardStyles = {
+  rootQuestion: { width: 420, minHeight: 96, maxHeight: 520, headingLevel: 1 },
+  rootAnswer: { width: 420, minHeight: 96, maxHeight: 520, headingLevel: 2 },
+  childQuestion: { width: 340, minHeight: 80, maxHeight: 400, headingLevel: 1 },
+  childAnswer: { width: 340, minHeight: 80, maxHeight: 400, headingLevel: 0 },
+};
+
 const DEFAULT_LAYOUT: LayoutSettings = {
   nodeWidth: 420,
   minNodeHeight: 96,
@@ -147,6 +186,7 @@ const DEFAULT_LAYOUT: LayoutSettings = {
   refHeight: 140,       // A2B2C1: 次轴固定高度
   refGap: 16,
   refColumnGap: 32,
+  cardStyles: DEFAULT_CARD_STYLES,
 };
 
 const DEFAULT_SETTINGS: GptCanvasSettings = {
@@ -163,6 +203,14 @@ export default class GptCanvasPlugin extends Plugin {
   currentSessionId = 'default';
   private activeRoundId = 0;
   private nextRoundId = 0;
+  // 引入防抖，避免高频写入
+  private updateCanvasDebounced = debounce(
+    async (data: SessionData) => {
+      await this.updateCanvasFromSession(data);
+    },
+    1000,
+    true
+  );
 
   async onload() {
     await this.loadSettings();
@@ -196,11 +244,22 @@ export default class GptCanvasPlugin extends Plugin {
 
   async loadSettings() {
     const saved = (await this.loadData()) || {};
+    const savedLayout = (saved as any).layout || {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved || {});
-    this.settings.layout = Object.assign({}, DEFAULT_LAYOUT, saved.layout || {});
+    this.settings.layout = Object.assign({}, DEFAULT_LAYOUT, savedLayout);
+    this.settings.layout.cardStyles = this.mergeCardStyles(savedLayout.cardStyles);
     this.settings.sessionFolders = Object.assign({}, (saved as any).sessionFolders || {});
   }
   async saveSettings() { await this.saveData(this.settings); }
+
+  private mergeCardStyles(saved?: Partial<CardStyles>): CardStyles {
+    return {
+      rootQuestion: Object.assign({}, DEFAULT_CARD_STYLES.rootQuestion, saved?.rootQuestion || {}),
+      rootAnswer: Object.assign({}, DEFAULT_CARD_STYLES.rootAnswer, saved?.rootAnswer || {}),
+      childQuestion: Object.assign({}, DEFAULT_CARD_STYLES.childQuestion, saved?.childQuestion || {}),
+      childAnswer: Object.assign({}, DEFAULT_CARD_STYLES.childAnswer, saved?.childAnswer || {}),
+    };
+  }
 
   /** ========= 侧栏 & DevTools ========= */
   async openChatGPTInSidebar() {
@@ -286,16 +345,40 @@ export default class GptCanvasPlugin extends Plugin {
   }
 
   /** ========= 工具函数 ========= */
-  private computeNodeSize(text: string, widthOverride?: number): { width: number; height: number } {
+  private computeNodeSize(text: string, width: number, cardStyle?: CardStyle): { width: number; height: number } {
     const l = this.settings.layout;
-    const width = widthOverride ?? l.nodeWidth;
-    const plain = text.replace(/\r/g, "");
-    const hard = plain.split("\n").length;
-    const soft = Math.ceil(plain.replace(/\n/g, "").length / Math.max(l.charsPerLine, 12));
+    const style = cardStyle || {};
+    const widthValue = Math.max(1, width);
+    const plain = text.replace(/\r/g, '');
+    const hard = plain.split('\n').length;
+    const soft = Math.ceil(plain.replace(/\n/g, '').length / Math.max(l.charsPerLine, 12));
     const lines = Math.max(hard, soft, 1);
-    const raw = lines * l.baseLineHeight + 28;
-    const height = Math.max(l.minNodeHeight, Math.min(raw, l.maxNodeHeight));
-    return { width, height };
+    const headingLevel = Math.max(0, Math.min(6, style.headingLevel ?? 0));
+    const lineHeight = l.baseLineHeight + headingLevel * 2;
+    const raw = lines * lineHeight + 28;
+    const minHeight = style.minHeight ?? l.minNodeHeight;
+    const maxHeight = style.maxHeight ?? l.maxNodeHeight;
+    const height = Math.max(minHeight, Math.min(raw, maxHeight));
+    return { width: widthValue, height };
+  }
+
+  private getCardStyle(depth: number, isQuestion: boolean): CardStyle {
+    const styles = this.settings.layout.cardStyles || DEFAULT_CARD_STYLES;
+    if (depth > 0) {
+      return isQuestion ? styles.childQuestion : styles.childAnswer;
+    }
+    return isQuestion ? styles.rootQuestion : styles.rootAnswer;
+  }
+
+  private removeReferenceSegment(text: string, segment: string): string {
+    if (!segment) return text;
+    const idx = text.indexOf(segment);
+    if (idx === -1) return text;
+    const before = text.slice(0, idx).replace(/\s+$/, '');
+    const after = text.slice(idx + segment.length).replace(/^\s+/, '');
+    if (!before) return after;
+    if (!after) return before;
+    return `${before}\n${after}`;
   }
 
   private truncateMd(md: string, maxChars = 180): string {
@@ -433,7 +516,9 @@ export default class GptCanvasPlugin extends Plugin {
     for (let i=0;i<snapMsgs.length;i++){
       const s = snapMsgs[i];
       const text = (s.text || "").trim();
-      if (!text) continue;
+      const domId = s.domId || '';
+      // [修复 Bug] 过滤掉 ChatGPT 的占位符消息或空消息
+      if (!text || domId.includes('placeholder')) continue;
       const role: Role = s.role === "user" ? "user" : "assistant";
       const id = s.domId || `auto-${role}-${i}`;
       const exist = byId.get(id);
@@ -449,7 +534,11 @@ export default class GptCanvasPlugin extends Plugin {
 
     // 把快照没出现但旧有的消息保留（保持其原 seq，不强行重排）
     const mergedMessages = Array.from(byId.values());
-    mergedMessages.sort((a,b)=>a.seq-b.seq);
+    const filteredMessages = mergedMessages.filter((m) => {
+      const text = (m.text || '').trim();
+      return text && !m.id.includes('placeholder');
+    });
+    filteredMessages.sort((a,b)=>a.seq-b.seq);
 
     // 合并 links：保留旧的，再根据本次选择添加新的（不覆盖）
     const mergedLinks: LinkItem[] = Array.isArray(prev.links) ? [...prev.links] : [];
@@ -462,7 +551,7 @@ export default class GptCanvasPlugin extends Plugin {
     if (payload.reason === "user-send" && payload.selection?.domId && selectionText) {
       // selection.domId = 源消息（多半是 A 的 domId）
       const fromId = payload.selection.domId;
-      const latestUser = [...mergedMessages].filter((m) => m.role === "user").sort((a, b) => b.seq - a.seq)[0];
+      const latestUser = [...filteredMessages].filter((m) => m.role === "user").sort((a, b) => b.seq - a.seq)[0];
       if (fromId && latestUser && latestUser.id !== fromId) {
         const link: LinkItem = {
           from: fromId,
@@ -481,11 +570,11 @@ export default class GptCanvasPlugin extends Plugin {
     }
 
     const sessionUrl = payload.url || prev.sessionUrl;
-    const data: SessionData = { messages: mergedMessages, links: mergedLinks, sessionUrl };
+    const data: SessionData = { messages: filteredMessages, links: mergedLinks, sessionUrl };
     await this.writeSession(data);
 
     if (this.settings.autoCreateCanvas) {
-      await this.updateCanvasFromSession(data);
+      this.updateCanvasDebounced(data);
     }
 
     if (payload.reason === "user-send") {
@@ -504,11 +593,14 @@ export default class GptCanvasPlugin extends Plugin {
     const L = this.settings.layout;
     const sessionUrl = data.sessionUrl ?? null;
 
+    const existingCanvas = await this.readExistingCanvas(canvasPath);
+    const existingNodes = existingCanvas?.nodes ?? [];
+    const existingEdges = existingCanvas?.edges ?? [];
     const nodes: CanvasNode[] = [];
-    const edges: CanvasEdge[] = [];
-
-    const byId = new Map<string, MessageItem>();
-    for (const m of data.messages) byId.set(m.id, m);
+    const edges: CanvasEdge[] = [...existingEdges];
+    const generatedNodeIds = new Set<string>();
+    const canvasNodeMap = new Map(existingNodes.map((node) => [node.id, node]));
+    const existingEdgeIds = new Set(edges.map((edge) => edge.id));
 
     const turns = this.buildTurns(data.messages);
     const turnByUserId = new Map<string, MessageTurn>();
@@ -534,90 +626,159 @@ export default class GptCanvasPlugin extends Plugin {
       arr.sort((a, b) => a.q.seq - b.q.seq);
     }
 
+    const referenceTextByQuestionId = new Map<string, string>();
+    for (const link of data.links) {
+      if (link.type !== 'ref') continue;
+      if (!link.to) continue;
+      const trimmed = (link.refText || '').trim();
+      if (trimmed) {
+        referenceTextByQuestionId.set(link.to, trimmed);
+      }
+    }
+
     const layoutTurn = (
       turn: MessageTurn,
       baseX: number,
       baseY: number,
       qWidth: number,
       aWidth: number,
-      _childColumnStartX: number,
       columnIndex: number
-    ): number => {
+    ): BoundingBox => {
+      const depth = columnIndex;
       const label = this.getTurnLabel(turn);
-      const qFull = `Q #${label}\n${turn.q.text}`;
-      const qSize = this.computeNodeSize(qFull, qWidth);
-      const aX = baseX + qWidth + L.horizontalGap;
-      let rowHeight = qSize.height;
+      const questionStyle = this.getCardStyle(depth, true);
+      const answerStyle = this.getCardStyle(depth, false);
+      const questionWidth = questionStyle.width ?? qWidth;
+      const answerWidth = answerStyle.width ?? aWidth;
+      const questionHeadingLevel = Math.max(0, Math.min(6, questionStyle.headingLevel ?? 1));
+      const answerHeadingLevel = Math.max(0, Math.min(6, answerStyle.headingLevel ?? 0));
+      const buildHeadingLine = (level: number, text: string) => (level === 0 ? text : `${'#'.repeat(level)} ${text}`);
+      const headingPrefix = questionHeadingLevel === 0 ? '' : '#'.repeat(questionHeadingLevel) + ' ';
+      const questionHeading = buildHeadingLine(questionHeadingLevel, `Q#${label}`);
+      const refText = referenceTextByQuestionId.get(turn.q.id);
+      const blockquote = refText ? `> ${refText.replace(/\n/g, '\n> ')}\n\n` : '';
+      const sanitizedQuestionText = refText ? this.removeReferenceSegment(turn.q.text, refText) : turn.q.text;
+      const applyHeadingPrefix = (value: string, prefix: string) => {
+        if (!prefix) return value;
+        return value
+          .split('\n')
+          .map((line) => (line.trim() ? `${prefix}${line}` : line))
+          .join('\n');
+      };
+      const questionBody = applyHeadingPrefix(sanitizedQuestionText, headingPrefix);
+      const qBody = blockquote ? `${blockquote}${questionBody}` : questionBody;
+      const qFull = `${questionHeading}\n${qBody}`;
 
-      const qMeta = this.buildNodeMetaForMessage(turn.q, sessionUrl);
-      const qNode: CanvasNode = {
+      const existingQNode = canvasNodeMap.get(turn.q.id);
+      let qMeta = this.extractMetaFromCanvasNode(existingQNode) || this.buildNodeMetaForMessage(turn.q, sessionUrl);
+
+      let finalQX = baseX;
+      let finalQY = baseY;
+      if (existingQNode) {
+        const isMoved = qMeta?.lastAutoPos &&
+          (Math.abs(existingQNode.x - qMeta.lastAutoPos.x) > 5 || Math.abs(existingQNode.y - qMeta.lastAutoPos.y) > 5);
+        if (qMeta?.manualPos) {
+          finalQX = qMeta.manualPos.x;
+          finalQY = qMeta.manualPos.y;
+        } else if (isMoved) {
+          finalQX = existingQNode.x;
+          finalQY = existingQNode.y;
+          if (qMeta) qMeta.manualPos = { x: finalQX, y: finalQY };
+        }
+      }
+      if (qMeta) qMeta.lastAutoPos = { x: baseX, y: baseY };
+
+      const qSize = this.computeNodeSize(qFull, questionWidth, questionStyle);
+      nodes.push({
         id: turn.q.id,
         type: 'text',
-        x: baseX,
-        y: baseY,
-        width: qWidth,
+        x: finalQX,
+        y: finalQY,
+        width: qSize.width,
         height: qSize.height,
         text: qFull,
         color: '4',
-      };
-      if (qMeta) qNode.object = qMeta;
-      nodes.push(qNode);
+        object: qMeta || undefined,
+      });
+      generatedNodeIds.add(turn.q.id);
+
+      let ghostBottom = baseY + qSize.height;
+      let ghostRight = baseX + qSize.width;
 
       if (turn.a) {
-        const aHeader = `A #${label}`;
-        const aFull = `${aHeader}\n${turn.a.text}`;
-        const aSize = this.computeNodeSize(aFull, aWidth);
-        const aMeta = this.buildNodeMetaForMessage(turn.a, sessionUrl);
-        const aNode: CanvasNode = {
+        const answerHeading = buildHeadingLine(answerHeadingLevel, `A#${label}`);
+        const answerPrefix = answerHeadingLevel === 0 ? '' : '#'.repeat(answerHeadingLevel) + ' ';
+        const answerBody = applyHeadingPrefix(turn.a.text, answerPrefix);
+        const aFull = `${answerHeading}\n${answerBody}`;
+        const existingANode = canvasNodeMap.get(turn.a.id);
+        let aMeta = this.extractMetaFromCanvasNode(existingANode) || this.buildNodeMetaForMessage(turn.a, sessionUrl);
+        const idealAX = baseX + qSize.width + L.horizontalGap;
+        const idealAY = baseY;
+        let finalAX = idealAX;
+        let finalAY = idealAY;
+
+        if (existingANode) {
+          const isMoved = aMeta?.lastAutoPos &&
+            (Math.abs(existingANode.x - aMeta.lastAutoPos.x) > 5 || Math.abs(existingANode.y - aMeta.lastAutoPos.y) > 5);
+          if (aMeta?.manualPos) {
+            finalAX = aMeta.manualPos.x;
+            finalAY = aMeta.manualPos.y;
+          } else if (isMoved) {
+            finalAX = existingANode.x;
+            finalAY = existingANode.y;
+            if (aMeta) aMeta.manualPos = { x: finalAX, y: finalAY };
+          }
+        }
+        if (aMeta) aMeta.lastAutoPos = { x: idealAX, y: idealAY };
+
+        const aSize = this.computeNodeSize(aFull, answerWidth, answerStyle);
+        nodes.push({
           id: turn.a.id,
           type: 'text',
-          x: aX,
-          y: baseY,
-          width: aWidth,
+          x: finalAX,
+          y: finalAY,
+          width: aSize.width,
           height: aSize.height,
           text: aFull,
           color: '3',
-        };
-        if (aMeta) aNode.object = aMeta;
-        nodes.push(aNode);
-        rowHeight = Math.max(rowHeight, aSize.height);
-      }
+          object: aMeta || undefined,
+        });
+        generatedNodeIds.add(turn.a.id);
 
-      // 以当前 turn 的回答卡片作为“引用源”，计算其右侧起始位置
-      const parentRightX = turn.a ? (aX + aWidth) : (baseX + qWidth);
+        ghostBottom = Math.max(ghostBottom, idealAY + aSize.height);
+        ghostRight = Math.max(ghostRight, idealAX + aSize.width);
+      }
 
       const parentId = turn.a ? turn.a.id : turn.q.id;
       const children = childTurnsByParent.get(parentId) || [];
-
-      let childrenHeight = 0;
       if (children.length > 0) {
-        const childX = parentRightX + L.refColumnGap;
-        let childY = baseY; // 第一个引用问题与来源顶部对齐
-        let maxBottom = baseY;
+        let childYCursor = baseY;
+        const childX = ghostRight + L.refColumnGap;
         for (const child of children) {
-          const childColumnWidth = L.refWidth;
-          const childConsumed = layoutTurn(
+          const childQuestionStyle = this.getCardStyle(columnIndex + 1, true);
+          const childAnswerStyle = this.getCardStyle(columnIndex + 1, false);
+          const childQuestionWidth = childQuestionStyle.width ?? L.refWidth;
+          const childAnswerWidth = childAnswerStyle.width ?? L.refWidth;
+          const childBox = layoutTurn(
             child,
             childX,
-            childY,
-            childColumnWidth,
-            childColumnWidth,
-            childX + childColumnWidth + L.horizontalGap + L.refColumnGap,
+            childYCursor,
+            childQuestionWidth,
+            childAnswerWidth,
             columnIndex + 1
           );
-          const childBottom = childY + childConsumed;
-          if (childBottom > maxBottom) maxBottom = childBottom;
-          childY = childBottom + L.verticalGap; // 后一个引用问题排在前一个回答下方
+          childYCursor = childBox.bottom + L.verticalGap;
+          ghostRight = Math.max(ghostRight, childBox.right);
         }
-        childrenHeight = maxBottom - baseY;
+        ghostBottom = Math.max(ghostBottom, childYCursor - L.verticalGap);
       }
 
-      return Math.max(rowHeight, childrenHeight);
+      return { right: ghostRight, bottom: ghostBottom };
     };
 
-    const aX = L.startX + L.nodeWidth + L.horizontalGap;
-    const childColumnStart = aX + L.nodeWidth + L.refColumnGap;
-    const firstRoot = turns.find((turn) => !turn.parentId);
+    const rootTurns = turns.filter((turn) => !turn.parentId);
+    let cursorY = L.startY;
+    const firstRoot = rootTurns[0];
     const firstTimestamp = firstRoot?.q.ts ?? firstRoot?.a?.ts ?? Date.now();
     const canvasTitle = this.formatCanvasTimestamp(firstTimestamp);
     if (firstRoot) {
@@ -625,8 +786,9 @@ export default class GptCanvasPlugin extends Plugin {
       const infoWidth = L.nodeWidth;
       const infoSize = this.computeNodeSize(infoText, infoWidth);
       const infoX = L.startX - infoWidth - L.horizontalGap;
-      nodes.push({
-        id: `info_${this.currentSessionId}`,
+      const infoNodeId = `info_${this.currentSessionId}`;
+      const infoNode: CanvasNode = {
+        id: infoNodeId,
         type: 'text',
         x: infoX,
         y: L.startY,
@@ -634,21 +796,25 @@ export default class GptCanvasPlugin extends Plugin {
         height: infoSize.height,
         text: infoText,
         color: '2',
-      });
+      };
+      nodes.push(infoNode);
+      generatedNodeIds.add(infoNodeId);
     }
 
-    let cursorY = L.startY;
-    for (const turn of turns.filter((t) => !t.parentId)) {
-      const consumed = layoutTurn(
+    const rootQuestionStyle = this.getCardStyle(0, true);
+    const rootAnswerStyle = this.getCardStyle(0, false);
+    const rootQuestionWidth = rootQuestionStyle.width ?? L.nodeWidth;
+    const rootAnswerWidth = rootAnswerStyle.width ?? L.nodeWidth;
+    for (const turn of rootTurns) {
+      const box = layoutTurn(
         turn,
         L.startX,
         cursorY,
-        L.nodeWidth,
-        L.nodeWidth,
-        childColumnStart,
+        rootQuestionWidth,
+        rootAnswerWidth,
         0
       );
-      cursorY += consumed + L.verticalGap;
+      cursorY = box.bottom + L.verticalGap;
     }
 
     for (const link of data.links) {
@@ -656,18 +822,46 @@ export default class GptCanvasPlugin extends Plugin {
       const child = turnByUserId.get(link.to);
       if (!child) continue;
       const targetId = child.a ? child.a.id : child.q.id;
+      const edgeId = `edge_${targetId}__to__${link.from}`;
+      if (existingEdgeIds.has(edgeId)) continue;
       edges.push({
-        id: `edge_${targetId}__to__${link.from}`,
+        id: edgeId,
         fromNode: targetId,
         toNode: link.from,
         fromSide: "left",
         toSide: "right",
         label: "ref",
       });
+      existingEdgeIds.add(edgeId);
     }
 
-    const canvas: CanvasData = { nodes, edges, version: 1, title: canvasTitle };
-    await adapter.write(canvasPath, JSON.stringify(canvas, null, 2));
+    for (const node of existingNodes) {
+      if (node.id.includes('placeholder')) continue;
+      if (!generatedNodeIds.has(node.id)) {
+        nodes.push(node);
+        generatedNodeIds.add(node.id);
+      }
+    }
+
+    const filteredEdges = edges.filter((edge) => generatedNodeIds.has(edge.fromNode) && generatedNodeIds.has(edge.toNode));
+    const canvas: CanvasData = { nodes, edges: filteredEdges, version: 1, title: canvasTitle };
+    const newContent = JSON.stringify(canvas, null, 2);
+    const oldContent = existingCanvas ? JSON.stringify(existingCanvas, null, 2) : '';
+    if (newContent !== oldContent) {
+      await adapter.write(canvasPath, newContent);
+    }
+  }
+
+  private async readExistingCanvas(canvasPath: string): Promise<CanvasData | null> {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(canvasPath))) return null;
+      const raw = await adapter.read(canvasPath);
+      return JSON.parse(raw) as CanvasData;
+    } catch (e) {
+      console.error('[gptCanvas] readExistingCanvas error:', e);
+      return null;
+    }
   }
 
   /** ========= 跳回 ChatGPT ========= */
