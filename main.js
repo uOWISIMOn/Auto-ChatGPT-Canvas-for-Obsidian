@@ -25,6 +25,12 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var VIEW_TYPE_CHATGPT = "gptcanvas-chatgpt-view";
 var LOG_ROOT = "ChatGPT Logs";
+var DEFAULT_CARD_STYLES = {
+  rootQuestion: { width: 420, minHeight: 96, maxHeight: 520, headingLevel: 1 },
+  rootAnswer: { width: 420, minHeight: 96, maxHeight: 520, headingLevel: 2 },
+  childQuestion: { width: 340, minHeight: 80, maxHeight: 400, headingLevel: 1 },
+  childAnswer: { width: 340, minHeight: 80, maxHeight: 400, headingLevel: 0 }
+};
 var DEFAULT_LAYOUT = {
   nodeWidth: 420,
   minNodeHeight: 96,
@@ -39,7 +45,8 @@ var DEFAULT_LAYOUT = {
   refHeight: 140,
   // A2B2C1: 次轴固定高度
   refGap: 16,
-  refColumnGap: 32
+  refColumnGap: 32,
+  cardStyles: DEFAULT_CARD_STYLES
 };
 var DEFAULT_SETTINGS = {
   chatgptUrl: "https://chatgpt.com",
@@ -54,6 +61,14 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     this.currentSessionId = "default";
     this.activeRoundId = 0;
     this.nextRoundId = 0;
+    // 引入防抖，避免高频写入
+    this.updateCanvasDebounced = (0, import_obsidian.debounce)(
+      async (data) => {
+        await this.updateCanvasFromSession(data);
+      },
+      1e3,
+      true
+    );
   }
   async onload() {
     await this.loadSettings();
@@ -82,12 +97,22 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
   }
   async loadSettings() {
     const saved = await this.loadData() || {};
+    const savedLayout = saved.layout || {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved || {});
-    this.settings.layout = Object.assign({}, DEFAULT_LAYOUT, saved.layout || {});
+    this.settings.layout = Object.assign({}, DEFAULT_LAYOUT, savedLayout);
+    this.settings.layout.cardStyles = this.mergeCardStyles(savedLayout.cardStyles);
     this.settings.sessionFolders = Object.assign({}, saved.sessionFolders || {});
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  mergeCardStyles(saved) {
+    return {
+      rootQuestion: Object.assign({}, DEFAULT_CARD_STYLES.rootQuestion, saved?.rootQuestion || {}),
+      rootAnswer: Object.assign({}, DEFAULT_CARD_STYLES.rootAnswer, saved?.rootAnswer || {}),
+      childQuestion: Object.assign({}, DEFAULT_CARD_STYLES.childQuestion, saved?.childQuestion || {}),
+      childAnswer: Object.assign({}, DEFAULT_CARD_STYLES.childAnswer, saved?.childAnswer || {})
+    };
   }
   /** ========= 侧栏 & DevTools ========= */
   async openChatGPTInSidebar() {
@@ -172,16 +197,39 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     await this.app.vault.adapter.write(jsonPath, JSON.stringify(data, null, 2));
   }
   /** ========= 工具函数 ========= */
-  computeNodeSize(text, widthOverride) {
+  computeNodeSize(text, width, cardStyle) {
     const l = this.settings.layout;
-    const width = widthOverride ?? l.nodeWidth;
+    const style = cardStyle || {};
+    const widthValue = Math.max(1, width);
     const plain = text.replace(/\r/g, "");
     const hard = plain.split("\n").length;
     const soft = Math.ceil(plain.replace(/\n/g, "").length / Math.max(l.charsPerLine, 12));
     const lines = Math.max(hard, soft, 1);
-    const raw = lines * l.baseLineHeight + 28;
-    const height = Math.max(l.minNodeHeight, Math.min(raw, l.maxNodeHeight));
-    return { width, height };
+    const headingLevel = Math.max(0, Math.min(6, style.headingLevel ?? 0));
+    const lineHeight = l.baseLineHeight + headingLevel * 2;
+    const raw = lines * lineHeight + 28;
+    const minHeight = style.minHeight ?? l.minNodeHeight;
+    const maxHeight = style.maxHeight ?? l.maxNodeHeight;
+    const height = Math.max(minHeight, Math.min(raw, maxHeight));
+    return { width: widthValue, height };
+  }
+  getCardStyle(depth, isQuestion) {
+    const styles = this.settings.layout.cardStyles || DEFAULT_CARD_STYLES;
+    if (depth > 0) {
+      return isQuestion ? styles.childQuestion : styles.childAnswer;
+    }
+    return isQuestion ? styles.rootQuestion : styles.rootAnswer;
+  }
+  removeReferenceSegment(text, segment) {
+    if (!segment) return text;
+    const idx = text.indexOf(segment);
+    if (idx === -1) return text;
+    const before = text.slice(0, idx).replace(/\s+$/, "");
+    const after = text.slice(idx + segment.length).replace(/^\s+/, "");
+    if (!before) return after;
+    if (!after) return before;
+    return `${before}
+${after}`;
   }
   truncateMd(md, maxChars = 180) {
     const s = (md || "").replace(/\n{3,}/g, "\n\n").trim();
@@ -308,7 +356,8 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     for (let i = 0; i < snapMsgs.length; i++) {
       const s = snapMsgs[i];
       const text = (s.text || "").trim();
-      if (!text) continue;
+      const domId = s.domId || "";
+      if (!text || domId.includes("placeholder")) continue;
       const role = s.role === "user" ? "user" : "assistant";
       const id = s.domId || `auto-${role}-${i}`;
       const exist = byId.get(id);
@@ -322,7 +371,11 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
       }
     }
     const mergedMessages = Array.from(byId.values());
-    mergedMessages.sort((a, b) => a.seq - b.seq);
+    const filteredMessages = mergedMessages.filter((m) => {
+      const text = (m.text || "").trim();
+      return text && !m.id.includes("placeholder");
+    });
+    filteredMessages.sort((a, b) => a.seq - b.seq);
     const mergedLinks = Array.isArray(prev.links) ? [...prev.links] : [];
     if (payload.reason === "user-send") {
       this.startRound();
@@ -330,7 +383,7 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     const selectionText = payload.selection && payload.selection.text ? payload.selection.text.trim() : "";
     if (payload.reason === "user-send" && payload.selection?.domId && selectionText) {
       const fromId = payload.selection.domId;
-      const latestUser = [...mergedMessages].filter((m) => m.role === "user").sort((a, b) => b.seq - a.seq)[0];
+      const latestUser = [...filteredMessages].filter((m) => m.role === "user").sort((a, b) => b.seq - a.seq)[0];
       if (fromId && latestUser && latestUser.id !== fromId) {
         const link = {
           from: fromId,
@@ -348,10 +401,10 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
       }
     }
     const sessionUrl = payload.url || prev.sessionUrl;
-    const data = { messages: mergedMessages, links: mergedLinks, sessionUrl };
+    const data = { messages: filteredMessages, links: mergedLinks, sessionUrl };
     await this.writeSession(data);
     if (this.settings.autoCreateCanvas) {
-      await this.updateCanvasFromSession(data);
+      this.updateCanvasDebounced(data);
     }
     if (payload.reason === "user-send") {
       this.completeRound();
@@ -367,10 +420,14 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     const adapter = this.app.vault.adapter;
     const L = this.settings.layout;
     const sessionUrl = data.sessionUrl ?? null;
+    const existingCanvas = await this.readExistingCanvas(canvasPath);
+    const existingNodes = existingCanvas?.nodes ?? [];
+    const existingEdges = existingCanvas?.edges ?? [];
     const nodes = [];
-    const edges = [];
-    const byId = /* @__PURE__ */ new Map();
-    for (const m of data.messages) byId.set(m.id, m);
+    const edges = [...existingEdges];
+    const generatedNodeIds = /* @__PURE__ */ new Set();
+    const canvasNodeMap = new Map(existingNodes.map((node) => [node.id, node]));
+    const existingEdgeIds = new Set(edges.map((edge) => edge.id));
     const turns = this.buildTurns(data.messages);
     const turnByUserId = /* @__PURE__ */ new Map();
     for (const turn of turns) {
@@ -394,76 +451,139 @@ var GptCanvasPlugin = class extends import_obsidian.Plugin {
     for (const arr of childTurnsByParent.values()) {
       arr.sort((a, b) => a.q.seq - b.q.seq);
     }
-    const layoutTurn = (turn, baseX, baseY, qWidth, aWidth, _childColumnStartX, columnIndex) => {
+    const referenceTextByQuestionId = /* @__PURE__ */ new Map();
+    for (const link of data.links) {
+      if (link.type !== "ref") continue;
+      if (!link.to) continue;
+      const trimmed = (link.refText || "").trim();
+      if (trimmed) {
+        referenceTextByQuestionId.set(link.to, trimmed);
+      }
+    }
+    const layoutTurn = (turn, baseX, baseY, qWidth, aWidth, columnIndex) => {
+      const depth = columnIndex;
       const label = this.getTurnLabel(turn);
-      const qFull = `Q #${label}
-${turn.q.text}`;
-      const qSize = this.computeNodeSize(qFull, qWidth);
-      const aX2 = baseX + qWidth + L.horizontalGap;
-      let rowHeight = qSize.height;
-      const qMeta = this.buildNodeMetaForMessage(turn.q, sessionUrl);
-      const qNode = {
+      const questionStyle = this.getCardStyle(depth, true);
+      const answerStyle = this.getCardStyle(depth, false);
+      const questionWidth = questionStyle.width ?? qWidth;
+      const answerWidth = answerStyle.width ?? aWidth;
+      const questionHeadingLevel = Math.max(0, Math.min(6, questionStyle.headingLevel ?? 1));
+      const answerHeadingLevel = Math.max(0, Math.min(6, answerStyle.headingLevel ?? 0));
+      const buildHeadingLine = (level, text) => level === 0 ? text : `${"#".repeat(level)} ${text}`;
+      const headingPrefix = questionHeadingLevel === 0 ? "" : "#".repeat(questionHeadingLevel) + " ";
+      const questionHeading = buildHeadingLine(questionHeadingLevel, `Q#${label}`);
+      const refText = referenceTextByQuestionId.get(turn.q.id);
+      const blockquote = refText ? `> ${refText.replace(/\n/g, "\n> ")}
+
+` : "";
+      const sanitizedQuestionText = refText ? this.removeReferenceSegment(turn.q.text, refText) : turn.q.text;
+      const applyHeadingPrefix = (value, prefix) => {
+        if (!prefix) return value;
+        return value.split("\n").map((line) => line.trim() ? `${prefix}${line}` : line).join("\n");
+      };
+      const questionBody = applyHeadingPrefix(sanitizedQuestionText, headingPrefix);
+      const qBody = blockquote ? `${blockquote}${questionBody}` : questionBody;
+      const qFull = `${questionHeading}
+${qBody}`;
+      const existingQNode = canvasNodeMap.get(turn.q.id);
+      let qMeta = this.extractMetaFromCanvasNode(existingQNode) || this.buildNodeMetaForMessage(turn.q, sessionUrl);
+      let finalQX = baseX;
+      let finalQY = baseY;
+      if (existingQNode) {
+        const isMoved = qMeta?.lastAutoPos && (Math.abs(existingQNode.x - qMeta.lastAutoPos.x) > 5 || Math.abs(existingQNode.y - qMeta.lastAutoPos.y) > 5);
+        if (qMeta?.manualPos) {
+          finalQX = qMeta.manualPos.x;
+          finalQY = qMeta.manualPos.y;
+        } else if (isMoved) {
+          finalQX = existingQNode.x;
+          finalQY = existingQNode.y;
+          if (qMeta) qMeta.manualPos = { x: finalQX, y: finalQY };
+        }
+      }
+      if (qMeta) qMeta.lastAutoPos = { x: baseX, y: baseY };
+      const qSize = this.computeNodeSize(qFull, questionWidth, questionStyle);
+      nodes.push({
         id: turn.q.id,
         type: "text",
-        x: baseX,
-        y: baseY,
-        width: qWidth,
+        x: finalQX,
+        y: finalQY,
+        width: qSize.width,
         height: qSize.height,
         text: qFull,
-        color: "4"
-      };
-      if (qMeta) qNode.object = qMeta;
-      nodes.push(qNode);
+        color: "4",
+        object: qMeta || void 0
+      });
+      generatedNodeIds.add(turn.q.id);
+      let ghostBottom = baseY + qSize.height;
+      let ghostRight = baseX + qSize.width;
       if (turn.a) {
-        const aHeader = `A #${label}`;
-        const aFull = `${aHeader}
-${turn.a.text}`;
-        const aSize = this.computeNodeSize(aFull, aWidth);
-        const aMeta = this.buildNodeMetaForMessage(turn.a, sessionUrl);
-        const aNode = {
+        const answerHeading = buildHeadingLine(answerHeadingLevel, `A#${label}`);
+        const answerPrefix = answerHeadingLevel === 0 ? "" : "#".repeat(answerHeadingLevel) + " ";
+        const answerBody = applyHeadingPrefix(turn.a.text, answerPrefix);
+        const aFull = `${answerHeading}
+${answerBody}`;
+        const existingANode = canvasNodeMap.get(turn.a.id);
+        let aMeta = this.extractMetaFromCanvasNode(existingANode) || this.buildNodeMetaForMessage(turn.a, sessionUrl);
+        const idealAX = baseX + qSize.width + L.horizontalGap;
+        const idealAY = baseY;
+        let finalAX = idealAX;
+        let finalAY = idealAY;
+        if (existingANode) {
+          const isMoved = aMeta?.lastAutoPos && (Math.abs(existingANode.x - aMeta.lastAutoPos.x) > 5 || Math.abs(existingANode.y - aMeta.lastAutoPos.y) > 5);
+          if (aMeta?.manualPos) {
+            finalAX = aMeta.manualPos.x;
+            finalAY = aMeta.manualPos.y;
+          } else if (isMoved) {
+            finalAX = existingANode.x;
+            finalAY = existingANode.y;
+            if (aMeta) aMeta.manualPos = { x: finalAX, y: finalAY };
+          }
+        }
+        if (aMeta) aMeta.lastAutoPos = { x: idealAX, y: idealAY };
+        const aSize = this.computeNodeSize(aFull, answerWidth, answerStyle);
+        nodes.push({
           id: turn.a.id,
           type: "text",
-          x: aX2,
-          y: baseY,
-          width: aWidth,
+          x: finalAX,
+          y: finalAY,
+          width: aSize.width,
           height: aSize.height,
           text: aFull,
-          color: "3"
-        };
-        if (aMeta) aNode.object = aMeta;
-        nodes.push(aNode);
-        rowHeight = Math.max(rowHeight, aSize.height);
+          color: "3",
+          object: aMeta || void 0
+        });
+        generatedNodeIds.add(turn.a.id);
+        ghostBottom = Math.max(ghostBottom, idealAY + aSize.height);
+        ghostRight = Math.max(ghostRight, idealAX + aSize.width);
       }
-      const parentRightX = turn.a ? aX2 + aWidth : baseX + qWidth;
       const parentId = turn.a ? turn.a.id : turn.q.id;
       const children = childTurnsByParent.get(parentId) || [];
-      let childrenHeight = 0;
       if (children.length > 0) {
-        const childX = parentRightX + L.refColumnGap;
-        let childY = baseY;
-        let maxBottom = baseY;
+        let childYCursor = baseY;
+        const childX = ghostRight + L.refColumnGap;
         for (const child of children) {
-          const childColumnWidth = L.refWidth;
-          const childConsumed = layoutTurn(
+          const childQuestionStyle = this.getCardStyle(columnIndex + 1, true);
+          const childAnswerStyle = this.getCardStyle(columnIndex + 1, false);
+          const childQuestionWidth = childQuestionStyle.width ?? L.refWidth;
+          const childAnswerWidth = childAnswerStyle.width ?? L.refWidth;
+          const childBox = layoutTurn(
             child,
             childX,
-            childY,
-            childColumnWidth,
-            childColumnWidth,
-            childX + childColumnWidth + L.horizontalGap + L.refColumnGap,
+            childYCursor,
+            childQuestionWidth,
+            childAnswerWidth,
             columnIndex + 1
           );
-          const childBottom = childY + childConsumed;
-          if (childBottom > maxBottom) maxBottom = childBottom;
-          childY = childBottom + L.verticalGap;
+          childYCursor = childBox.bottom + L.verticalGap;
+          ghostRight = Math.max(ghostRight, childBox.right);
         }
-        childrenHeight = maxBottom - baseY;
+        ghostBottom = Math.max(ghostBottom, childYCursor - L.verticalGap);
       }
-      return Math.max(rowHeight, childrenHeight);
+      return { right: ghostRight, bottom: ghostBottom };
     };
-    const aX = L.startX + L.nodeWidth + L.horizontalGap;
-    const childColumnStart = aX + L.nodeWidth + L.refColumnGap;
-    const firstRoot = turns.find((turn) => !turn.parentId);
+    const rootTurns = turns.filter((turn) => !turn.parentId);
+    let cursorY = L.startY;
+    const firstRoot = rootTurns[0];
     const firstTimestamp = firstRoot?.q.ts ?? firstRoot?.a?.ts ?? Date.now();
     const canvasTitle = this.formatCanvasTimestamp(firstTimestamp);
     if (firstRoot) {
@@ -472,8 +592,9 @@ ${canvasTitle}`;
       const infoWidth = L.nodeWidth;
       const infoSize = this.computeNodeSize(infoText, infoWidth);
       const infoX = L.startX - infoWidth - L.horizontalGap;
-      nodes.push({
-        id: `info_${this.currentSessionId}`,
+      const infoNodeId = `info_${this.currentSessionId}`;
+      const infoNode = {
+        id: infoNodeId,
         type: "text",
         x: infoX,
         y: L.startY,
@@ -481,37 +602,67 @@ ${canvasTitle}`;
         height: infoSize.height,
         text: infoText,
         color: "2"
-      });
+      };
+      nodes.push(infoNode);
+      generatedNodeIds.add(infoNodeId);
     }
-    let cursorY = L.startY;
-    for (const turn of turns.filter((t) => !t.parentId)) {
-      const consumed = layoutTurn(
+    const rootQuestionStyle = this.getCardStyle(0, true);
+    const rootAnswerStyle = this.getCardStyle(0, false);
+    const rootQuestionWidth = rootQuestionStyle.width ?? L.nodeWidth;
+    const rootAnswerWidth = rootAnswerStyle.width ?? L.nodeWidth;
+    for (const turn of rootTurns) {
+      const box = layoutTurn(
         turn,
         L.startX,
         cursorY,
-        L.nodeWidth,
-        L.nodeWidth,
-        childColumnStart,
+        rootQuestionWidth,
+        rootAnswerWidth,
         0
       );
-      cursorY += consumed + L.verticalGap;
+      cursorY = box.bottom + L.verticalGap;
     }
     for (const link of data.links) {
       if (link.type !== "ref") continue;
       const child = turnByUserId.get(link.to);
       if (!child) continue;
       const targetId = child.a ? child.a.id : child.q.id;
+      const edgeId = `edge_${targetId}__to__${link.from}`;
+      if (existingEdgeIds.has(edgeId)) continue;
       edges.push({
-        id: `edge_${targetId}__to__${link.from}`,
+        id: edgeId,
         fromNode: targetId,
         toNode: link.from,
         fromSide: "left",
         toSide: "right",
         label: "ref"
       });
+      existingEdgeIds.add(edgeId);
     }
-    const canvas = { nodes, edges, version: 1, title: canvasTitle };
-    await adapter.write(canvasPath, JSON.stringify(canvas, null, 2));
+    for (const node of existingNodes) {
+      if (node.id.includes("placeholder")) continue;
+      if (!generatedNodeIds.has(node.id)) {
+        nodes.push(node);
+        generatedNodeIds.add(node.id);
+      }
+    }
+    const filteredEdges = edges.filter((edge) => generatedNodeIds.has(edge.fromNode) && generatedNodeIds.has(edge.toNode));
+    const canvas = { nodes, edges: filteredEdges, version: 1, title: canvasTitle };
+    const newContent = JSON.stringify(canvas, null, 2);
+    const oldContent = existingCanvas ? JSON.stringify(existingCanvas, null, 2) : "";
+    if (newContent !== oldContent) {
+      await adapter.write(canvasPath, newContent);
+    }
+  }
+  async readExistingCanvas(canvasPath) {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!await adapter.exists(canvasPath)) return null;
+      const raw = await adapter.read(canvasPath);
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error("[gptCanvas] readExistingCanvas error:", e);
+      return null;
+    }
   }
   /** ========= 跳回 ChatGPT ========= */
   async scrollToMessage(messageId) {
